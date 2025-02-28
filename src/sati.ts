@@ -622,20 +622,22 @@ function createAgentInstance(
                 matchEndIndex,
               ).trim();
 
-              if (outputDataContent.includes("<think>")) return response;
+              if (outputDataContent.includes("<think>") || outputDataContent.includes("<thinking>")) {
+                return true;
+              }
 
               const responseWithoutOutputData = response.slice(0, startIndex) +
                 response.slice(matchEndIndex + endTag.length);
 
-              const thinkRegex = /<think>([\s\S]*?)<\/think>/i;
-              const externalThinkMatch = thinkRegex.exec(
-                responseWithoutOutputData,
-              );
+              const thinkRegex = /<(think|thinking)>([\s\S]*?)<\/\1>/i;
+              const externalThinkMatch = thinkRegex.exec(responseWithoutOutputData);
+              
               if (!externalThinkMatch) return response;
 
-              const externalThinkContent = externalThinkMatch[1].trim();
+              const tagName = externalThinkMatch[1];
+              const externalThinkContent = externalThinkMatch[2].trim();
 
-              return `${startTag}${outputDataContent}<think>${externalThinkContent}</think>${endTag}`;
+              return `${startTag}${outputDataContent}<${tagName}>${externalThinkContent}</${tagName}>${endTag}`;
             };
 
             modifiedResponse = it(response);
