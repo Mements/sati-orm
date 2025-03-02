@@ -1,53 +1,33 @@
 # @mements/sati-orm
 
-A type-safe persistence layer for your zod objects, designed specifically for AI agents but versatile enough for any input/output workflow.
+A type-safe persistence layer for AI agents with semantic memory and structured I/O.
 
-## What
+```typescript
+// Create a customer support agent in 5 lines
+import { Agent } from '@mements/sati-orm';
+import { z } from 'zod';
 
-It's a database library that divides everything into input and output tables - a pattern that works remarkably well for many scenarios:
-
-- AI Agents: Store questions and answers with rich metadata
-- Task Processing: Schedule tasks (input) and track results (output)
-- Financial Systems: Track credits and debits
-- Event Systems: Handle triggers and effects
-
-The key innovation is that both input and output are full database tables with complex schemas, not just simple strings. These schemas are generated automatically from your zod definitions, enabling type-safe operations throughout your application.
-
-Important: This is an append-only database by design. It doesn't allow editing previously inserted items, enforcing immutable data patterns.
-
-## Why
-
-- **Type-Safe Objects as Prompts**: Use structured data instead of raw text
-- **Rich Response Schemas**: Define exactly what you expect back
-- **Long-term Memory**: Built-in semantic search capabilities
-- **Distributed Architecture**: Safe and decentralized model inference
-- **Agent Persistence**: Maintain agent personality and context across sessions
-
-## Features
-
-- 🔒 Type-safe with Zod schemas
-- 🔍 Vector search with sqlite-vec
-- 🌐 Remote agent connections
-- 🤖 Multiple LLM support (DeepSeek, GPT, Claude, Grok)
-- 📝 Automatic schema migration
-- 🔎 Flexible querying and recall
-- 🏃 High-performance SQLite backend
+const ticketSchema = z.object({ issue: z.string() });
+const responseSchema = z.object({ solution: z.string() });
+const supportAgent = Agent('support').init(ticketSchema, responseSchema);
+```
 
 ## Quick Start
 
 ```bash
-bunx @mements/sati-orm@latest
+# Install the package
+npm install @mements/sati-orm zod
+
+# Set up your environment variables
+echo "EMBEDDINGS_API_KEY=your_key" > .env
+echo "ANTHROPIC_API_KEY=your_key" >> .env  # Or any other LLM provider
 ```
 
-## Usage Examples
-
-### Basic Agent Setup
-
 ```typescript
-import { Agent } from '@mements/database';
+import { Agent } from '@mements/sati-orm';
 import { z } from 'zod';
 
-// Define your schemas
+// 1. Define your schemas
 const inputSchema = z.object({
   question: z.string(),
   context: z.string().optional()
@@ -55,94 +35,357 @@ const inputSchema = z.object({
 
 const outputSchema = z.object({
   answer: z.string(),
-  confidence: z.number(),
-  sources: z.array(z.string())
+  sources: z.array(z.string()).optional()
 });
 
-// Create an agent
-const agent = Agent('my_agent')
-  .init(inputSchema, outputSchema);
-```
+// 2. Initialize your agent
+const agent = Agent('my_agent').init(inputSchema, outputSchema);
 
-### Inference
-
-```typescript
+// 3. Use your agent
 const result = await agent.infer({
-  question: "What is the capital of France?",
-  context: "Looking for geographic information"
-}, {
-  temperature: 0.7,
-  model: "deepseek-ai/DeepSeek-R1"
+  question: "What is sati-orm?",
+  context: "I'm building an AI application"
 });
+
+console.log(result);
+// { answer: "Sati-ORM is a type-safe persistence layer...", sources: [...] }
 ```
 
-### Semantic Search
+## System Architecture
 
-```typescript
-const similar = await agent.recall({
-  question: "What is Paris known for?"
-}, null);
+Sati-ORM creates a powerful dual-table architecture with vector embeddings:
+
+```
+┌───────────────────┐       ┌────────────────────┐
+│    Input Table    │       │    Output Table    │
+├───────────────────┤       ├────────────────────┤
+│ id: string (PK)   │───┐   │ id: string (PK)    │
+│ field1: type      │   └──>│ field1: type       │
+│ field2: type      │       │ field2: type       │
+│ object_json: text │       │ object_json: text  │
+└───────────────────┘       └────────────────────┘
+         │                             │
+         └──────────────┬──────────────┘
+                        │
+                        ▼
+              ┌──────────────────────┐
+              │     Vector Index     │
+              ├──────────────────────┤
+              │ id: string           │
+              │ agent_name: string   │
+              │ input_embedding: vec │
+              │ output_embedding: vec│
+              └──────────────────────┘
 ```
 
-### Training/Reinforcement
+### How It Works
+
+When you create and use an agent, here's what happens under the hood:
+
+1. **Schema Translation**: Your Zod schemas are converted to SQLite tables
+2. **Data Storage**: Input/output pairs are stored in their respective tables
+3. **Vector Embedding**: Text is converted to vector embeddings for semantic search
+4. **LLM Formatting**: Data is formatted as XML for consistent LLM responses
+5. **Type Validation**: All data is validated against your schemas
+
+## RAG-Enabled Customer Support Bot
+
+Let's build a complete customer support agent with retrieval-augmented generation:
 
 ```typescript
-await agent.reinforce({
-  question: "What is the capital of France?"
-}, {
-  answer: "Paris",
-  confidence: 0.99,
-  sources: ["Wikipedia"]
+import { Agent } from '@mements/sati-orm';
+import { z } from 'zod';
+
+// Define ticket schema with customer data and conversation history
+const ticketSchema = z.object({
+  customer: z.object({
+    name: z.string(),
+    email: z.string().email(),
+    tier: z.enum(['free', 'pro', 'enterprise'])
+  }),
+  issue: z.string().describe('Customer problem description'),
+  category: z.enum(['billing', 'technical', 'account']).optional(),
+  // This field will store similar past tickets for RAG
+  similarIssues: z.array(z.object({
+    issue: z.string(),
+    solution: z.string()
+  })).optional()
 });
+
+// Define response schema
+const responseSchema = z.object({
+  solution: z.string().describe('Response to customer'),
+  internalNotes: z.string().describe('Notes for support team'),
+  nextSteps: z.array(z.string()),
+  category: z.enum(['billing', 'technical', 'account'])
+});
+
+// Create and initialize the agent
+const supportBot = Agent('support_bot').init(ticketSchema, responseSchema);
 ```
 
-### Remote Agents
+### What Happens When We Initialize the Agent?
+
+When `init()` is called, the following database tables are created:
+
+```
+┌───────────────────────────┐      ┌─────────────────────────────┐
+│ input_support_bot (table) │      │ output_support_bot (table)  │
+├───────────────────────────┤      ├─────────────────────────────┤
+│ id: TEXT PRIMARY KEY      │      │ id: TEXT PRIMARY KEY        │
+│ customer_json: TEXT       │      │ solution: TEXT              │
+│ issue: TEXT               │      │ internalNotes: TEXT         │
+│ category: TEXT            │      │ nextSteps_json: TEXT        │
+│ similarIssues_json: TEXT  │      │ category: TEXT              │
+└───────────────────────────┘      └─────────────────────────────┘
+```
+
+Notice how:
+- Complex objects like `customer` become JSON fields (`customer_json`)
+- Arrays like `nextSteps` become JSON fields (`nextSteps_json`)
+- Simple fields remain as their respective SQL types
+
+### Implementing RAG Workflow
+
+Now let's implement a complete RAG workflow:
 
 ```typescript
-const remoteAgent = Agent('remote_agent')
-  .connectRemote('https://api.example.com/agents');
+// Process a new customer ticket with RAG
+async function handleTicket(ticketData) {
+  // 1. Extract the issue
+  const { issue } = ticketData;
+  
+  // 2. Search for similar past tickets using vector similarity
+  const similarTickets = await supportBot.recall({ issue }, null);
+  console.log(`Found ${similarTickets.length} similar tickets`);
+  
+  // Diagram of what happens during recall():
+  // 
+  // ┌──────────┐    ┌─────────────┐    ┌──────────────┐
+  // │  Input   │───>│  Generate   │───>│Input Embedding│
+  // │ (issue)  │    │  Embedding  │    │   (vector)    │
+  // └──────────┘    └─────────────┘    └──────────────┘
+  //                                            │
+  //                                            ▼
+  // ┌──────────────────┐    ┌─────────────────────────────┐
+  // │ Similar Records  │<───│ Vector Similarity Search    │
+  // │ (sorted by      │    │ in vec_index table           │
+  // │  similarity)    │    │ using input_embedding MATCH  │
+  // └──────────────────┘    └─────────────────────────────┘
+  
+  // 3. Extract relevant context from similar tickets
+  const relevantTickets = similarTickets.slice(0, 3).map(ticket => ({
+    issue: ticket.input.issue,
+    solution: ticket.output.solution
+  }));
+  
+  // 4. Create augmented ticket with RAG context
+  const augmentedTicket = {
+    ...ticketData,
+    similarIssues: relevantTickets
+  };
+  
+  // 5. Generate response using augmented context
+  const response = await supportBot.infer(augmentedTicket, {
+    temperature: 0.3,  // Lower for more consistent support responses
+    model: "claude-3-opus-20240229"
+  });
+  
+  // Diagram of what happens during infer():
+  //
+  // ┌──────────────┐    ┌─────────────┐    ┌───────────────┐
+  // │ Augmented    │───>│ Convert to  │───>│ Send to LLM   │
+  // │ Ticket Data  │    │ XML Format  │    │ with Schemas  │
+  // └──────────────┘    └─────────────┘    └───────────────┘
+  //                                                │
+  //                                                ▼
+  // ┌──────────────┐    ┌─────────────┐    ┌───────────────┐
+  // │ Validated    │<───│ Parse XML   │<───│ LLM Response  │
+  // │ Response     │    │ Response    │    │ as XML        │
+  // └──────────────┘    └─────────────┘    └───────────────┘
+  
+  // 6. Store this interaction for future reference
+  await supportBot.reinforce(augmentedTicket, response);
+  
+  // Diagram of what happens during reinforce():
+  //
+  // ┌──────────┐    ┌──────────────┐    ┌────────────────┐
+  // │ Input &  │───>│ Generate     │───>│ Input & Output │
+  // │ Output   │    │ Embeddings   │    │ Embeddings     │
+  // └──────────┘    └──────────────┘    └────────────────┘
+  //       │                                     │
+  //       ▼                                     ▼
+  // ┌─────────────────┐              ┌─────────────────────┐
+  // │ Store in Input  │              │ Store in vec_index  │
+  // │ & Output Tables │              │ for future recall   │
+  // └─────────────────┘              └─────────────────────┘
+  
+  return response;
+}
+
+// Example usage
+const ticket = {
+  customer: {
+    name: "Jordan Smith",
+    email: "jordan@example.com",
+    tier: "pro"
+  },
+  issue: "I can't export my data to CSV. The export button is disabled.",
+  category: "technical"
+};
+
+const response = await handleTicket(ticket);
+console.log(response);
+```
+
+### Updating Ticket Data
+
+When the customer provides additional information, you can update the record:
+
+```typescript
+// Update the ticket with new information
+async function updateTicket(id, newData) {
+  // Edit stored record
+  await supportBot.edit(id, newData);
+  
+  // Diagram of what happens during edit():
+  //
+  // ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+  // │ Record ID &  │───>│ Retrieve     │───>│ Update       │
+  // │ New Data     │    │ Existing Data│    │ Database     │
+  // └──────────────┘    └──────────────┘    └──────────────┘
+  //                                                │
+  //                                                ▼
+  // ┌──────────────────┐             ┌────────────────────────┐
+  // │ Update Vector    │<────────────│ Generate New Embeddings│
+  // │ Index            │             │ For Changed Fields     │
+  // └──────────────────┘             └────────────────────────┘
+}
 ```
 
 ## API Reference
 
-### Agent Creation
-- `Agent(name: string)`: Create a new agent instance
-- `init(fromSchema: ZodObject, toSchema: ZodObject)`: Initialize schemas
-- `connectRemote(url: string)`: Connect to remote agent
+### Agent Creation and Management
 
-### Operations
-- `infer(input, options?)`: Generate output from input
-- `recall(input, output)`: Find similar past interactions
-- `reinforce(input, output)`: Train with example pairs
-- `find(input?, output?)`: Query stored data
-- `store(input, output)`: Store without embeddings
-- `addIndex(table, field)`: Create database index
-- `edit(id, input, output?)`: Modify stored data
-- `delete(id)`: Remove record
-- `erase()`: Delete agent and all data
+```typescript
+// Create or access an agent
+Agent(name: string)
 
-## Environment Variables
+// Initialize with schemas  
+agent.init(inputSchema: ZodObject, outputSchema: ZodObject)
 
-```bash
-EMBEDDINGS_API_KEY=your_key
-EMBEDDINGS_API_URL=https://api.example.com/embeddings
-DEEPSEEK_API_KEY=your_key
-AGENT_MODE=silent  # Optional: suppress logs
+// Connect to remote agent
+agent.connectRemote(url: string)
+
+// Delete agent and all data
+agent.erase()
 ```
 
-## Technical Details
+### Core Operations
 
-- Uses SQLite with vector extension for efficient similarity search
-- Automatically generates SQL schemas from Zod definitions
-- Transforms data to/from XML for LLM interactions
-- Supports nested object structures and arrays
-- Maintains vector embeddings for semantic search
-- Provides transaction safety and schema validation
+```typescript
+// Generate output using LLM
+await agent.infer(
+  input: YourInputType,
+  options?: {
+    temperature?: number;   // 0-1, controls randomness
+    model?: string;         // e.g., "claude-3-opus-20240229"
+    reasoning_effort?: string; // For models that support it
+  }
+)
 
-## License
+// Find similar past interactions
+await agent.recall(
+  input: YourInputType | null,
+  output: YourOutputType | null
+)
 
-MIT
+// Store with vector embeddings
+await agent.reinforce(input, output)
+
+// Store without embeddings
+await agent.store(input, output)
+```
+
+### Data Management
+
+```typescript
+// Query stored data by exact match
+await agent.find(inputFilter?, outputFilter?)
+
+// Create index for faster queries
+await agent.addIndex("input" | "output", fieldName)
+
+// Update stored record
+await agent.edit(id, inputUpdates?, outputUpdates?)
+
+// Delete record
+await agent.delete(id)
+```
+
+## Data Flow Diagram
+
+```
+┌─────────────┐     ┌────────────┐     ┌───────────────┐
+│ Define Zod  │────>│ Initialize │────>│ SQLite Tables │
+│ Schemas     │     │ Agent      │     │ Created       │
+└─────────────┘     └────────────┘     └───────────────┘
+                                               │
+      ┌────────────────────────────────────────┘
+      │
+      ▼
+┌─────────────┐     ┌────────────┐     ┌───────────────┐
+│ Agent.infer │────>│ LLM Call   │────>│ XML Response  │
+│ (input)     │     │ with XML   │     │ Parsed        │
+└─────────────┘     └────────────┘     └───────────────┘
+      │                                        │
+      │                                        ▼
+      │                               ┌───────────────┐
+      │                               │ Validated     │
+      │                               │ Output        │
+      │                               └───────────────┘
+      │                                        │
+      ▼                                        ▼
+┌─────────────┐     ┌────────────┐     ┌───────────────┐
+│ Agent.      │────>│ Store Data │────>│ Generate      │
+│ reinforce   │     │ in Tables  │     │ Embeddings    │
+└─────────────┘     └────────────┘     └───────────────┘
+                                               │
+                                               ▼
+                                      ┌───────────────┐
+                                      │ Store in      │
+                                      │ Vector Index  │
+                                      └───────────────┘
+```
+
+## Environment Configuration
+
+```typescript
+// Required for embeddings
+EMBEDDINGS_API_KEY=your_key
+EMBEDDINGS_API_URL=https://api.example.com/embeddings  // Optional
+
+// At least one LLM provider required
+ANTHROPIC_API_KEY=your_key    // For Claude
+OPENAI_API_KEY=your_key       // For GPT models
+DEEPSEEK_API_KEY=your_key     // For DeepSeek models
+GROK_API_KEY=your_key         // For Grok models
+
+// Optional configuration
+AGENT_MODE=silent             // Suppress logs
+SATI_DB_NAME=custom_db_name   // Custom database name
+VERBOSE_MODE=true             // Enable detailed logging
+```
+
+## Supported LLM Models
+
+| Provider | Model Examples                  | Environment Variable  |
+|----------|--------------------------------|----------------------|
+| Claude   | claude-3-opus-20240229        | ANTHROPIC_API_KEY    |
+| GPT      | gpt-4-turbo                   | OPENAI_API_KEY       |
+| DeepSeek | deepseek-ai/DeepSeek-R1       | DEEPSEEK_API_KEY     |
+| Grok     | grok-1                        | GROK_API_KEY         |
 
 ---
 
-Built with ❤️ by Mements Team
+MIT Licensed | [Mements Team](https://github.com/mements)
