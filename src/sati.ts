@@ -251,6 +251,10 @@ type AgentInstance<I extends z.ZodObject<any>, O extends z.ZodObject<any>> = {
   ) => Promise<{ id: string; input: z.infer<I>; output: z.infer<O> }>;
   delete: (id: string) => Promise<{ id: string }>;
   erase: () => void;
+  call: (
+    input: z.infer<I>,
+    options?: { timeout?: number }
+  ) => Promise<z.infer<O>>;  
 };
 
 function Agent<I extends z.ZodObject<any>, O extends z.ZodObject<any>>(name: string) {
@@ -433,6 +437,7 @@ function Agent<I extends z.ZodObject<any>, O extends z.ZodObject<any>>(name: str
       return inst.find(input, output);
     },
 
+    // todo: probably store should be renamed to insert
     async store(input: z.infer<I>, output: z.infer<O>) {
       if (remoteUrl) {
         throw new Error("Cannot store data for agent when connected remotely");
@@ -448,9 +453,9 @@ function Agent<I extends z.ZodObject<any>, O extends z.ZodObject<any>>(name: str
       }
       const inst = await getOrCreateInstance();
       return inst.addIndex(table, field);
-
     },
 
+    // todo: and edit renamed to update
     async edit(id: string, input: Partial<z.infer<I>>, output?: Partial<z.infer<O>>) {
       const filters = { input, output };
       if (remoteUrl) {
@@ -467,6 +472,73 @@ function Agent<I extends z.ZodObject<any>, O extends z.ZodObject<any>>(name: str
       const inst = await getOrCreateInstance();
       return inst.delete(id);
     },
+    /*
+todo: and then we implement "call" method which looks something like this aka inserting input only first and then waiting for its output to be inferred by daemon process and then we retrieve its id and we use that id to find corresponding output and return it from our call
+
+call: async function(input: z.infer<I>, options: { timeout?: number } = {}) {
+  // Default timeout: 60 seconds
+  const timeout = options.timeout || 60000;
+  
+  // Insert the input
+  const { id } = await this.insert(input);
+  
+  // Return a promise that resolves when the output is ready
+  return new Promise((resolve, reject) => {
+    // Set timeout
+    const timeoutId = setTimeout(() => {
+      reject(new Error(`Timeout waiting for response to input ${id}`));
+    }, timeout);
+    
+    // Set up WebSocket connection to listen for updates
+    const ws = new WebSocket(process.env.SATI_SERVER_URL || 'ws://localhost:3333');
+    
+    ws.onopen = () => {
+      // Subscribe to this agent's updates
+      ws.send(JSON.stringify({
+        type: 'subscribe',
+        agent: name
+      }));
+    };
+    
+    ws.onmessage = async (event) => {
+      try {
+        const message = JSON.parse(event.data);
+        
+        // Check if this is our response
+        if (
+          message.type === 'update' && 
+          message.agent === name && 
+          (message.data.id === id || message.data.input_id === id)
+        ) {
+          // Clear timeout
+          clearTimeout(timeoutId);
+          
+          // Get the full record
+          const records = await this.find({ id });
+          if (records.length > 0) {
+            resolve(records[0].output);
+            ws.close();
+          }
+        }
+      } catch (error) {
+        console.error('Error processing WebSocket message:', error);
+      }
+    };
+    
+    ws.onerror = (error) => {
+      clearTimeout(timeoutId);
+      reject(error);
+      ws.close();
+    };
+    
+    ws.onclose = () => {
+      // If we're still waiting, reject
+      clearTimeout(timeoutId);
+      reject(new Error('WebSocket connection closed before receiving response'));
+    };
+  });
+}
+    */
 
     async erase() {
       if (remoteUrl) {
@@ -653,7 +725,7 @@ function createAgentInstance(
         "Agent",
         `Inference for ${name}`,
       );
-    },
+    },    
 
     async recall(
       input: z.infer<typeof fromSchema> | null,
