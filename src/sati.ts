@@ -7,11 +7,13 @@ import path from "path";
 import ShortUniqueId from "short-unique-id";
 import { z } from "zod";
 import { mkdir } from "node:fs/promises";
+import WebSocket from "ws";
 
 import { dezerialize, type SzType, zerialize } from "zodex";
 import dedent from "dedent";
 import { OUTPUT_DATA_WRAPPER, RESERVED_SQLITE_WORDS } from "./constants";
-import { measure, objToXml, validateSchemaMatch, validateSchemaOutput, verboseLog, zodToSqliteSchema } from "./helpers";
+import { objToXml, validateSchemaMatch, validateSchemaOutput, zodToSqliteSchema } from "./helpers";
+import chalk from "chalk";
 
 const { randomUUID: uuid } = new ShortUniqueId({
   length: 12,
@@ -72,6 +74,81 @@ let db: Database;
     );
   `).run();
 }
+
+export const verboseLog = (category: string, action: string, details?: any) => {
+  const isVerbose = process.env.VERBOSE_MODE !== undefined
+    ? process.env.VERBOSE_MODE === "true"
+    : import.meta.main;
+
+  if (isVerbose) {
+    const categoryStr = chalk.blue(`[${category}]`);
+    const actionStr = chalk.green(action);
+
+    let detailsStr = "";
+    if (details) {
+      if (typeof details === "string" && details.includes("ms")) {
+        detailsStr = chalk.gray(` (${details})`);
+      } else if (details instanceof Error) {
+        console.error(details);
+        detailsStr = `${details}`;
+      } else {
+        const indent = " ".repeat(category.length + 3);
+        const formattedDetails = typeof details === "string"
+          ? details
+          : JSON.stringify(details, null, 2)
+              .split("\n")
+              .join(`\n${indent}`);
+        detailsStr = `\n${indent}${chalk.gray(formattedDetails)}`;
+      }
+    }
+
+    const message = `${categoryStr} ${actionStr}${detailsStr}`;
+
+    if (action?.startsWith("Starting") || action?.startsWith("Completed")) {
+      console.log("");
+    }
+
+    console.log(message);
+  }
+};
+
+export async function measure<T>(
+  fn: () => Promise<T>,
+  category: string,
+  action: string,
+): Promise<T> {
+  const start = performance.now();
+  try {
+    verboseLog(category, `Starting ${action}`);
+    const result = await fn();
+    const duration = performance.now() - start;
+    verboseLog(category, `Completed ${action}`, `${duration.toFixed(2)}ms`);
+    return result;
+  } catch (error) {
+    verboseLog(category, `Failed ${action}`, error);
+    throw `${category} ${action} failed`;
+  }
+}
+
+export async function measure<T>(
+  fn: () => Promise<T>,
+  category: string,
+  action: string,
+): Promise<T> {
+  const start = performance.now();
+  try {
+    verboseLog(category, `Starting ${action}`);
+    const result = await fn();
+    const duration = performance.now() - start;
+    verboseLog(category, `Completed ${action}`, `${duration.toFixed(2)}ms`);
+    return result;
+  } catch (error) {
+    verboseLog(category, `Failed ${action}`, error);
+    throw `${category} ${action} failed`;
+  }
+}
+
+const embeddingCache = new Map<string, number[]>();
 
 const systemMessage = dedent`
 Instructions for Response Generation:
@@ -237,7 +314,7 @@ type AgentInstance<I extends z.ZodObject<any>, O extends z.ZodObject<any>> = {
     input?: Partial<z.infer<I>>,
     output?: Partial<z.infer<O>>,
   ) => Promise<Array<{ id: string; input: z.infer<I>; output: z.infer<O> }>>;
-  store: (
+  insert: (
     input: z.infer<I>,
     output: z.infer<O>,
   ) => Promise<{ id: string }>;
@@ -245,7 +322,7 @@ type AgentInstance<I extends z.ZodObject<any>, O extends z.ZodObject<any>> = {
     table: "input" | "output",
     field: string,
   ) => Promise<void>;
-  edit: (
+  update: (
     id: string,
     input: Partial<z.infer<I>>, output?: Partial<z.infer<O>>,
   ) => Promise<{ id: string; input: z.infer<I>; output: z.infer<O> }>;
@@ -437,14 +514,19 @@ function Agent<I extends z.ZodObject<any>, O extends z.ZodObject<any>>(name: str
       return inst.find(input, output);
     },
 
-    // todo: probably store should be renamed to insert
-    async store(input: z.infer<I>, output: z.infer<O>) {
+    // Renamed from store to insert
+    async insert(input: z.infer<I>, output: z.infer<O>) {
       if (remoteUrl) {
-        throw new Error("Cannot store data for agent when connected remotely");
+        throw new Error("Cannot insert data for agent when connected remotely");
       }
 
       const inst = await getOrCreateInstance();
       return inst.store(input, output);
+    },
+
+    // For backward compatibility
+    async store(input: z.infer<I>, output: z.infer<O>) {
+      return this.insert(input, output);
     },
 
     async addIndex(table: "input" | "output", field: string) {
@@ -455,14 +537,18 @@ function Agent<I extends z.ZodObject<any>, O extends z.ZodObject<any>>(name: str
       return inst.addIndex(table, field);
     },
 
-    // todo: and edit renamed to update
-    async edit(id: string, input: Partial<z.infer<I>>, output?: Partial<z.infer<O>>) {
-      const filters = { input, output };
+    // Renamed from edit to update
+    async update(id: string, input: Partial<z.infer<I>>, output?: Partial<z.infer<O>>) {
       if (remoteUrl) {
-        throw new Error("Cannot edit data for agent when connected remotely");
+        throw new Error("Cannot update data for agent when connected remotely");
       }
       const inst = await getOrCreateInstance();
       return inst.edit(id, { input, output });
+    },
+
+    // For backward compatibility
+    async edit(id: string, input: Partial<z.infer<I>>, output?: Partial<z.infer<O>>) {
+      return this.update(id, input, output);
     },
 
     async delete(id: string) {
@@ -472,73 +558,57 @@ function Agent<I extends z.ZodObject<any>, O extends z.ZodObject<any>>(name: str
       const inst = await getOrCreateInstance();
       return inst.delete(id);
     },
-    /*
-todo: and then we implement "call" method which looks something like this aka inserting input only first and then waiting for its output to be inferred by daemon process and then we retrieve its id and we use that id to find corresponding output and return it from our call
 
-call: async function(input: z.infer<I>, options: { timeout?: number } = {}) {
-  // Default timeout: 60 seconds
-  const timeout = options.timeout || 60000;
+    
+    async call(input: z.infer<I>, options: { timeout?: number } = {}) {
+      const timeout = options.timeout || 60000;
   
-  // Insert the input
-  const { id } = await this.insert(input);
-  
-  // Return a promise that resolves when the output is ready
-  return new Promise((resolve, reject) => {
-    // Set timeout
-    const timeoutId = setTimeout(() => {
-      reject(new Error(`Timeout waiting for response to input ${id}`));
-    }, timeout);
-    
-    // Set up WebSocket connection to listen for updates
-    const ws = new WebSocket(process.env.SATI_SERVER_URL || 'ws://localhost:3333');
-    
-    ws.onopen = () => {
-      // Subscribe to this agent's updates
-      ws.send(JSON.stringify({
-        type: 'subscribe',
-        agent: name
-      }));
-    };
-    
-    ws.onmessage = async (event) => {
-      try {
-        const message = JSON.parse(event.data);
+      const { id } = await this.insert(input, {});
+      
+      return new Promise((resolve, reject) => {
+        const timeoutId = setTimeout(() => reject(new Error(`Timeout after ${timeout}ms`)), timeout);
         
-        // Check if this is our response
-        if (
-          message.type === 'update' && 
-          message.agent === name && 
-          (message.data.id === id || message.data.input_id === id)
-        ) {
-          // Clear timeout
-          clearTimeout(timeoutId);
+        const ws = new WebSocket(process.env.SATI_DAEMON_URL || 'ws://localhost:3333');
+        
+        ws.onopen = () => {
+          ws.send(JSON.stringify({ 
+            type: 'subscribe', 
+            agent: name 
+          }));
           
-          // Get the full record
-          const records = await this.find({ id });
-          if (records.length > 0) {
-            resolve(records[0].output);
-            ws.close();
+          ws.send(JSON.stringify({
+            type: 'new_task',
+            agent: name,
+            id: id
+          }));
+        };
+        
+        ws.onmessage = async (event) => {
+          const message = JSON.parse(event.data);
+          
+          if (message.type === 'subscribed') {
           }
-        }
-      } catch (error) {
-        console.error('Error processing WebSocket message:', error);
-      }
-    };
-    
-    ws.onerror = (error) => {
-      clearTimeout(timeoutId);
-      reject(error);
-      ws.close();
-    };
-    
-    ws.onclose = () => {
-      // If we're still waiting, reject
-      clearTimeout(timeoutId);
-      reject(new Error('WebSocket connection closed before receiving response'));
-    };
-  });
-}
-    */
+          else if (message.type === 'update' && message.agent === name && 
+              (message.data.id === id || message.data.input_id === id)) {
+            clearTimeout(timeoutId);
+            const records = await this.find({ id });
+            if (records.length > 0) {
+              resolve(records[0].output);
+              ws.close();
+            } else {
+              resolve({});
+              ws.close();
+            }
+          }
+        };
+        
+        ws.onerror = (error) => {
+          clearTimeout(timeoutId);
+          reject(error);
+          ws.close();
+        };
+      });
+    },
 
     async erase() {
       if (remoteUrl) {
@@ -735,7 +805,15 @@ function createAgentInstance(
         async () => {
           const target = input ? fromSchema.parse(input) : toSchema.parse(output);
           const targetXml = objToXml(target);
-          const targetEmbed = await getEmbedding(targetXml); // todo: we should implement another table for caching these embeddings if its same targetXml we dont need to regenerate it just retrieve and it applies to recall as well to reinforce
+          
+          let targetEmbed: number[];
+          
+          if (embeddingCache.has(targetXml)) {
+            targetEmbed = embeddingCache.get(targetXml)!;
+          } else {
+            targetEmbed = await getEmbedding(targetXml);
+            embeddingCache.set(targetXml, targetEmbed);
+          }
 
           let query = dedent`
           WITH similars AS (
@@ -848,9 +926,23 @@ function createAgentInstance(
 
           const inputXml = objToXml(validInput);
           const outputXml = objToXml(validOutput);
-
-          const inputEmbed = await getEmbedding(inputXml);
-          const outputEmbed = await getEmbedding(outputXml);
+          
+          let inputEmbed: number[];
+          let outputEmbed: number[];
+          
+          if (embeddingCache.has(inputXml)) {
+            inputEmbed = embeddingCache.get(inputXml)!;
+          } else {
+            inputEmbed = await getEmbedding(inputXml);
+            embeddingCache.set(inputXml, inputEmbed);
+          }
+          
+          if (embeddingCache.has(outputXml)) {
+            outputEmbed = embeddingCache.get(outputXml)!;
+          } else {
+            outputEmbed = await getEmbedding(outputXml);
+            embeddingCache.set(outputXml, outputEmbed);
+          }
 
           db.query(`
             INSERT INTO vec_index (id, agent_name, input_embedding, output_embedding)
