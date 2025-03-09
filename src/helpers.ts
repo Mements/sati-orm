@@ -13,23 +13,29 @@ export async function measure<T>(
   const level = context.level || 0;
   const indent = "=".repeat(level);
   const requestId = context.requestId;
-  const logPrefix = requestId ? `[${requestId}] ${indent}>` : indent;
+  const logPrefix = requestId ? `[${requestId}] ${indent}>` : `${indent}>`;
 
   try {
-      console.log(logPrefix, `Starting ${action}`);
-      const result = await fn((nestedFn, nestedAction) =>
-          measure(nestedFn, nestedAction, {
-              requestId: `${requestId}`,
-              level: level + 1,
-              parentAction: action
-          })
-      );
-      const duration = performance.now() - start;
-      console.log(logPrefix, `Completed ${action}`, `${duration.toFixed(2)}ms`);
-      return result;
+    // Log the start of the action with "..."
+    console.log(`${logPrefix} ${action}...`);
+    
+    const result = await fn((nestedFn, nestedAction) =>
+      measure(nestedFn, nestedAction, {
+        requestId: requestId ? `${requestId}` : undefined,
+        level: level + 1,
+        parentAction: action
+      })
+    );
+    
+    const duration = performance.now() - start;
+    // Log successful completion with "✓" and duration
+    console.log(`${logPrefix} ${action} ✓ ${duration.toFixed(2)}ms`);
+    return result;
   } catch (error) {
-      console.log(logPrefix, `Failed ${action}`, error);
-      throw `${action} failed: ${error}`;
+    const duration = performance.now() - start;
+    // Log failure with "✗", duration, and error
+    console.log(`${logPrefix} ${action} ✗ ${duration.toFixed(2)}ms`, error);
+    throw new Error(`${action} failed: ${error}`);
   }
 }
 

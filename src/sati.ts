@@ -26,7 +26,11 @@ interface AgentRecord {
   to_schema: string;
   input_table: string;
   output_table: string;
+  database_path: string;
 }
+
+// Database connection pool to manage multiple database connections
+const dbConnections: Map<string, Database> = new Map();
 
 export const verboseLog = (category: string, action: string, details?: any) => {
   const isVerbose = process.env.VERBOSE_MODE !== undefined
@@ -85,26 +89,24 @@ export async function measure<T>(
 
 type SQLiteValue = string | number | boolean | null | Uint8Array;
 
-// todo: we keep using ~/.mements/sati.sqlite database for agents table BUT for every each agent we should create separate database file with name of the agent like ~/.mements/$agent.sqlite and so we store our input/output tables for the agent in that database and we maintain multiple Database instance connections so we know which one to access to read/write for the agent because we store database name in our agents table and it corresponds to the agent name 
+// Main database for agents table
+let mainDb: Database;
+const dataDir = path.join(
+  import.meta.dir.startsWith("/$bunfs/root") ||
+  import.meta.dir.startsWith("B:\\~BUN\\root")
+    ? `${process.execPath}/..`
+    : path.join(process.env.HOME!, ".mements")
+);
 
-let db: Database;
 {
-  const dirname =
-    import.meta.dir.startsWith("/$bunfs/root") ||
-    import.meta.dir.startsWith("B:\\~BUN\\root")
-      ? `${process.execPath}/..`
-      : path.join(process.env.HOME!, ".mements");
-
   const dbPath = path.join(
-    dirname,
+    dataDir,
     `${process.env.SATI_DB_NAME ?? "sati"}.sqlite`,
   );
-  verboseLog("Database", "Initializing", { path: dbPath });
+  verboseLog("Database", "Initializing main database", { path: dbPath });
 
   await mkdir(path.dirname(dbPath), { recursive: true });
-  db = new Database(dbPath);
-
-  sqliteVec.load(db);
+  mainDb = new Database(dbPath);
 
   if (os.platform() === "darwin") {
     Database.setCustomSQLite(
@@ -112,17 +114,54 @@ let db: Database;
     );
   }
 
-  db.query(`
+  // todo: because we separated each agent into its own database, we probably dont need to store input/output table here anymore because its always called "input" and "output"
+  mainDb.query(`
     CREATE TABLE IF NOT EXISTS agents (
       name TEXT PRIMARY KEY,
       from_schema TEXT,
       to_schema TEXT,
       input_table TEXT,
-      output_table TEXT
+      output_table TEXT,
+      database_path TEXT
     )
-  `).run();
+  `).run(); // todo: explain why storing database_path is safe and will work if we move databases across machines
 
-  db.query<AgentRecord, any>(`
+  try {
+    mainDb.query("SELECT database_path FROM agents LIMIT 1").get();
+  } catch (e) {
+    verboseLog("Database", "Adding database_path column to agents table");
+    mainDb.query("ALTER TABLE agents ADD COLUMN database_path TEXT").run();
+    
+    // Update existing records to use separate database files
+    const existingAgents = mainDb.query<AgentRecord, any>("SELECT name FROM agents").all();
+    for (const agent of existingAgents) {
+      const dbPath = path.join(dataDir, `${agent.name}.sqlite`);
+      mainDb.query("UPDATE agents SET database_path = ? WHERE name = ?").run(dbPath, agent.name);
+    }
+  }
+}
+
+// Function to get or create an agent-specific database connection
+function getAgentDb(agentName: string): Database {
+  if (dbConnections.has(agentName)) {
+    return dbConnections.get(agentName)!;
+  }
+
+  const agent = mainDb
+    .query<AgentRecord, any>("SELECT * FROM agents WHERE name = ?")
+    .get(agentName);
+
+  if (!agent) {
+    throw new Error(`Agent ${agentName} not found`);
+  }
+
+  verboseLog("Database", `Opening connection to agent database`, { agent: agentName, path: agent.database_path });
+
+  const agentDb = new Database(agent.database_path);
+  sqliteVec.load(agentDb);
+  
+  // Create vector index table in agent database
+  agentDb.query<AgentRecord, any>(`
     CREATE VIRTUAL TABLE IF NOT EXISTS vec_index USING vec0(
       id TEXT PRIMARY KEY,
       agent_name TEXT NOT NULL PARTITION KEY,
@@ -130,6 +169,9 @@ let db: Database;
       output_embedding FLOAT[1536]
     );
   `).run();
+
+  dbConnections.set(agentName, agentDb);
+  return agentDb;
 }
 
 const embeddingCache = new Map<string, number[]>();
@@ -348,7 +390,7 @@ function Agent<I extends z.ZodObject<any>, O extends z.ZodObject<any>>(name: str
   const getOrCreateInstance = async () => {
     if (instance) return instance;
 
-    const agent = db
+    const agent = mainDb
       .query<AgentRecord, any>("SELECT * FROM agents WHERE name = ?")
       .get(name);
 
@@ -400,7 +442,7 @@ function Agent<I extends z.ZodObject<any>, O extends z.ZodObject<any>>(name: str
       if (remoteUrl) {
         throw new Error("exists getter cannot be used with remote connection, use async check instead");
       }
-      const agent = db
+      const agent = mainDb
         .query<AgentRecord, any>("SELECT * FROM agents WHERE name = ?")
         .get(name);
       return !!agent;
@@ -420,23 +462,50 @@ function Agent<I extends z.ZodObject<any>, O extends z.ZodObject<any>>(name: str
         throw new Error("Agent already initialized");
       }
 
-      const inputTable = `input_${name}`;
-      const outputTable = `output_${name}`;
+      const inputTable = `input`;
+      const outputTable = `output`;
+      
+      // Create agent-specific database file
+      const dbPath = path.join(dataDir, `${name}.sqlite`);
+      verboseLog("Database", `Creating agent database`, { agent: name, path: dbPath });
+      
+      // todo: explain why we dont use await here in a dev note
+      mkdir(path.dirname(dbPath), { recursive: true }).then(() => {
+        // Create and initialize the agent database
+        const agentDb = new Database(dbPath);
+        sqliteVec.load(agentDb);
+        
+        // Create tables in agent database
+        agentDb.query(zodToSqliteSchema(from, inputTable)).run();
+        agentDb.query(zodToSqliteSchema(to, outputTable)).run();
+        
+        // todo: maybe we can reuse getAgentDb here
+        agentDb.query(`
+          CREATE VIRTUAL TABLE IF NOT EXISTS vec_index USING vec0(
+            id TEXT PRIMARY KEY,
+            agent_name TEXT NOT NULL PARTITION KEY,
+            input_embedding FLOAT[1536],
+            output_embedding FLOAT[1536]
+          );
+        `).run();
+        
+        // Store database connection
+        dbConnections.set(name, agentDb);
+      });
 
-      db.query(zodToSqliteSchema(from, inputTable)).run();
-      db.query(zodToSqliteSchema(to, outputTable)).run();
+      logVerbose("Created tables", { inputTable, outputTable, dbPath });
 
-      logVerbose("Created tables", { inputTable, outputTable });
-
-      db.query(`
-        INSERT INTO agents (name, from_schema, to_schema, input_table, output_table)
-        VALUES (?, ?, ?, ?, ?)
+      // Store agent metadata in main database
+      mainDb.query(`
+        INSERT INTO agents (name, from_schema, to_schema, input_table, output_table, database_path)
+        VALUES (?, ?, ?, ?, ?, ?)
       `).run(
         name,
         JSON.stringify(zerialize(from)),
         JSON.stringify(zerialize(to)),
         inputTable,
         outputTable,
+        dbPath,
       );
 
       instance = createAgentInstance(
@@ -599,7 +668,7 @@ function Agent<I extends z.ZodObject<any>, O extends z.ZodObject<any>>(name: str
         throw new Error("Cannot delete agent when connected remotely");
       }
       
-      const agent = db
+      const agent = mainDb
         .query<AgentRecord, any>("SELECT * FROM agents WHERE name = ?")
         .get(name);
 
@@ -607,16 +676,16 @@ function Agent<I extends z.ZodObject<any>, O extends z.ZodObject<any>>(name: str
         throw new Error("Agent not found");
       }
 
-      const tx = db.transaction((name, input_table, output_table) => {
-        db.query(`DROP TABLE IF EXISTS ${input_table}`).run();
-        db.query(`DROP TABLE IF EXISTS ${output_table}`).run();
-        db.query(`DELETE FROM vec_index WHERE agent_name = ?`).run(name);
-        db.query(`DELETE FROM agents WHERE name = ?`).run(name);  
-      })
+      // Close the database connection if it exists
+      if (dbConnections.has(name)) {
+        const db = dbConnections.get(name)!;
+        db.close();
+        dbConnections.delete(name);
+      }
 
-      const it = tx(name, agent.input_table, agent.output_table);
-      console.log("erased ==> ", name);
-
+      // Remove agent from agents table
+      mainDb.query(`DELETE FROM agents WHERE name = ?`).run(name);
+      
       // Reset instance
       instance = null;
 
@@ -645,7 +714,7 @@ function createAgentInstance(
   outputTable: string,
   logVerbose: (action: string, details: any) => void,
 ) {
-  const existingAgent = db
+  const existingAgent = mainDb
     .query<AgentRecord, any>("SELECT * FROM agents WHERE name = ?")
     .get(name);
 
@@ -657,8 +726,10 @@ function createAgentInstance(
       existingAgent.from_schema,
       existingAgent.to_schema,
     );
-
   }
+
+  // Get the agent-specific database
+  const agentDb = getAgentDb(name);
 
   const insertRecord = (table: string, data: Record<string, any>) => {
     return measure(
@@ -669,7 +740,24 @@ function createAgentInstance(
           if (typeof v === "object") return JSON.stringify(v);
           return v as SQLiteValue;
         });
-        db.query(
+/*
+todo:
+
+fix
+
+[Database] Starting Insert into input
+739 |         const placeholders = columns.map(() => "?").join(", ");
+740 |         const values = Object.values(data).map(v => {
+741 |           if (typeof v === "object") return JSON.stringify(v);
+742 |           return v as SQLiteValue;
+743 |         });
+744 |         agentDb.query(
+                      ^
+SQLiteError: no such table: input
+      errno: 1,
+ byteOffset: -1,
+*/
+        agentDb.query(
           `INSERT INTO ${table} (${columns.join(", ")}) VALUES (${placeholders})`,
         ).run(...values);
       },
@@ -818,7 +906,7 @@ function createAgentInstance(
           logVerbose("Running similarity search", { query, name, embedSize: targetEmbed.length });
 
           const results = await measure(
-            async () => db.query(query).all(...params),
+            async () => agentDb.query(query).all(...params),
             "Database",
             "Similarity search",
           );
@@ -860,8 +948,6 @@ function createAgentInstance(
                   outputData[key] = value;
                 }
               }
-              // logVerbose("inputData", inputData);
-              // logVerbose("outputData", outputData);
 
               return {
                 id: row.id,
@@ -928,7 +1014,7 @@ function createAgentInstance(
             embeddingCache.set(outputXml, outputEmbed);
           }
 
-          db.query(`
+          agentDb.query(`
             INSERT INTO vec_index (id, agent_name, input_embedding, output_embedding)
             VALUES (?, ?, ?, ?)
           `).run(
@@ -1050,7 +1136,7 @@ function createAgentInstance(
           logVerbose("Running query", { query, params });
 
           const results = await measure(
-            async () => db.query(query).all(...params),
+            async () => agentDb.query(query).all(...params),
             "Database",
             "Filter records",
           );
@@ -1119,7 +1205,7 @@ function createAgentInstance(
           logVerbose("Creating index", { table: tableName, field, indexName });
 
           try {
-            db.query(`CREATE INDEX IF NOT EXISTS ${indexName} ON ${tableName}(${field})`).run();
+            agentDb.query(`CREATE INDEX IF NOT EXISTS ${indexName} ON ${tableName}(${field})`).run();
             logVerbose("Index created successfully", { indexName });
           } catch (err) {
             logVerbose("Index creation failed", err);
@@ -1143,7 +1229,7 @@ function createAgentInstance(
             throw new Error("No changes provided for edit.");
           }
 
-          const row = db.query(`
+          const row = agentDb.query(`
                 SELECT i.*, o.*
                 FROM ${inputTable} i
                 JOIN ${outputTable} o ON i.id = o.id
@@ -1188,14 +1274,14 @@ function createAgentInstance(
           const inputColumns = Object.keys(flatInput);
           const inputSetClause = inputColumns.map(col => `${col} = ?`).join(", ");
           const inputValues = Object.values(flatInput);
-          db.query(`UPDATE ${inputTable} SET ${inputSetClause} WHERE id = ?`).run(...inputValues, id);
+          agentDb.query(`UPDATE ${inputTable} SET ${inputSetClause} WHERE id = ?`).run(...inputValues, id);
 
           const outputColumns = Object.keys(flatOutput);
           const outputSetClause = outputColumns.map(col => `${col} = ?`).join(", ");
           const outputValues = Object.values(flatOutput);
-          db.query(`UPDATE ${outputTable} SET ${outputSetClause} WHERE id = ?`).run(...outputValues, id);
+          agentDb.query(`UPDATE ${outputTable} SET ${outputSetClause} WHERE id = ?`).run(...outputValues, id);
 
-          const vecRow = db.query(
+          const vecRow = agentDb.query(
             `SELECT * FROM vec_index WHERE id = ? AND agent_name = ?`
           ).get(id, name);
           if (vecRow) {
@@ -1216,7 +1302,7 @@ function createAgentInstance(
               newOutputEmbed = JSON.parse(vecRow.output_embedding);
             }
 
-            db.query(`
+            agentDb.query(`
             UPDATE vec_index SET input_embedding = ?, output_embedding = ?
             WHERE id = ? AND agent_name = ?
           `).run(JSON.stringify(newInputEmbed), JSON.stringify(newOutputEmbed), id, name);
@@ -1235,10 +1321,10 @@ function createAgentInstance(
         async () => {
           logVerbose("Deleting record", { id });
 
-          db.query(`DELETE FROM ${inputTable} WHERE id = ?`).run(id);
-          db.query(`DELETE FROM ${outputTable} WHERE id = ?`).run(id);
+          agentDb.query(`DELETE FROM ${inputTable} WHERE id = ?`).run(id);
+          agentDb.query(`DELETE FROM ${outputTable} WHERE id = ?`).run(id);
           try {
-            db.query(`DELETE FROM vec_index WHERE id = ? AND agent_name = ?`).run(id, name);
+            agentDb.query(`DELETE FROM vec_index WHERE id = ? AND agent_name = ?`).run(id, name);
             logVerbose("Deleted record from vec_index", { id });
           } catch (e) {
             logVerbose("Vec index deletion error", { id, error: e });
