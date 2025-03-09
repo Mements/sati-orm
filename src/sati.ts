@@ -28,53 +28,6 @@ interface AgentRecord {
   output_table: string;
 }
 
-type SQLiteValue = string | number | boolean | null | Uint8Array;
-
-let db: Database;
-{
-  const dirname =
-    import.meta.dir.startsWith("/$bunfs/root") ||
-    import.meta.dir.startsWith("B:\\~BUN\\root")
-      ? `${process.execPath}/..`
-      : path.join(process.env.HOME!, ".mements");
-
-  const dbPath = path.join(
-    dirname,
-    `${process.env.SATI_DB_NAME ?? "sati"}.sqlite`,
-  );
-  verboseLog("Database", "Initializing", { path: dbPath });
-
-  await mkdir(path.dirname(dbPath), { recursive: true });
-  db = new Database(dbPath);
-
-  sqliteVec.load(db);
-
-  if (os.platform() === "darwin") {
-    Database.setCustomSQLite(
-      "/opt/homebrew/Cellar/sqlite/3.47.0/lib/libsqlite3.0.dylib",
-    );
-  }
-
-  db.query(`
-    CREATE TABLE IF NOT EXISTS agents (
-      name TEXT PRIMARY KEY,
-      from_schema TEXT,
-      to_schema TEXT,
-      input_table TEXT,
-      output_table TEXT
-    )
-  `).run();
-
-  db.query<AgentRecord, any>(`
-    CREATE VIRTUAL TABLE IF NOT EXISTS vec_index USING vec0(
-      id TEXT PRIMARY KEY,
-      agent_name TEXT NOT NULL PARTITION KEY,
-      input_embedding FLOAT[1536],
-      output_embedding FLOAT[1536]
-    );
-  `).run();
-}
-
 export const verboseLog = (category: string, action: string, details?: any) => {
   const isVerbose = process.env.VERBOSE_MODE !== undefined
     ? process.env.VERBOSE_MODE === "true"
@@ -130,22 +83,53 @@ export async function measure<T>(
   }
 }
 
-export async function measure<T>(
-  fn: () => Promise<T>,
-  category: string,
-  action: string,
-): Promise<T> {
-  const start = performance.now();
-  try {
-    verboseLog(category, `Starting ${action}`);
-    const result = await fn();
-    const duration = performance.now() - start;
-    verboseLog(category, `Completed ${action}`, `${duration.toFixed(2)}ms`);
-    return result;
-  } catch (error) {
-    verboseLog(category, `Failed ${action}`, error);
-    throw `${category} ${action} failed`;
+type SQLiteValue = string | number | boolean | null | Uint8Array;
+
+// todo: we keep using ~/.mements/sati.sqlite database for agents table BUT for every each agent we should create separate database file with name of the agent like ~/.mements/$agent.sqlite and so we store our input/output tables for the agent in that database and we maintain multiple Database instance connections so we know which one to access to read/write for the agent because we store database name in our agents table and it corresponds to the agent name 
+
+let db: Database;
+{
+  const dirname =
+    import.meta.dir.startsWith("/$bunfs/root") ||
+    import.meta.dir.startsWith("B:\\~BUN\\root")
+      ? `${process.execPath}/..`
+      : path.join(process.env.HOME!, ".mements");
+
+  const dbPath = path.join(
+    dirname,
+    `${process.env.SATI_DB_NAME ?? "sati"}.sqlite`,
+  );
+  verboseLog("Database", "Initializing", { path: dbPath });
+
+  await mkdir(path.dirname(dbPath), { recursive: true });
+  db = new Database(dbPath);
+
+  sqliteVec.load(db);
+
+  if (os.platform() === "darwin") {
+    Database.setCustomSQLite(
+      "/opt/homebrew/Cellar/sqlite/3.47.0/lib/libsqlite3.0.dylib",
+    );
   }
+
+  db.query(`
+    CREATE TABLE IF NOT EXISTS agents (
+      name TEXT PRIMARY KEY,
+      from_schema TEXT,
+      to_schema TEXT,
+      input_table TEXT,
+      output_table TEXT
+    )
+  `).run();
+
+  db.query<AgentRecord, any>(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS vec_index USING vec0(
+      id TEXT PRIMARY KEY,
+      agent_name TEXT NOT NULL PARTITION KEY,
+      input_embedding FLOAT[1536],
+      output_embedding FLOAT[1536]
+    );
+  `).run();
 }
 
 const embeddingCache = new Map<string, number[]>();
@@ -964,18 +948,20 @@ function createAgentInstance(
     },
 
     async store(
-      input: z.infer<typeof fromSchema>,
-      output: z.infer<typeof toSchema>,
+      input: z.infer<I>,
+      output?: Partial<z.infer<O>> | null,
     ) {
       return measure(
         async () => {
           logVerbose("Storing input/output pair", { input, output });
-
+    
+          // Validate input
           const validInput = fromSchema.parse(input);
-          const validOutput = toSchema.parse(output);
-
+          
+          // Get a new ID for this record
           const id = uuid();
-
+    
+          // Prepare input for storage
           const flatInput = Object.fromEntries(
             Object.entries(validInput).map(([k, v]) =>
               typeof v === "object"
@@ -983,17 +969,32 @@ function createAgentInstance(
                 : [k, v]
             ),
           );
-          const flatOutput = Object.fromEntries(
-            Object.entries(validOutput).map(([k, v]) =>
-              typeof v === "object"
-                ? [`${k}_json`, JSON.stringify(v)]
-                : [k, v]
-            ),
-          );
-
+          
+          // Insert input record
           await insertRecord(inputTable, { id, ...flatInput });
-          await insertRecord(outputTable, { id, ...flatOutput });
-
+          
+          // Only insert output if provided and not null
+          if (output && Object.keys(output).length > 0) {
+            try {
+              // Validate output (use partial validation if it's not complete)
+              const validOutput = toSchema.partial().parse(output);
+              
+              // Prepare output for storage
+              const flatOutput = Object.fromEntries(
+                Object.entries(validOutput).map(([k, v]) =>
+                  typeof v === "object"
+                    ? [`${k}_json`, JSON.stringify(v)]
+                    : [k, v]
+                ),
+              );
+              
+              // Insert output record
+              await insertRecord(outputTable, { id, ...flatOutput });
+            } catch (error) {
+              console.warn(`Warning: Invalid output for ${id}, storing input only:`, error);
+            }
+          }
+    
           logVerbose("Stored data with id", { id });
           return { id };
         },

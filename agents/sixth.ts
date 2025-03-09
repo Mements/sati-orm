@@ -9,9 +9,13 @@ const outputSchema = z.object({
   response: z.string()
 });
 
-export const agent = Agent<typeof inputSchema, typeof outputSchema>('sixth_agent').init(inputSchema, outputSchema);
+const agent = Agent<typeof inputSchema, typeof outputSchema>('sixth_agent');
 
-export { inputSchema, outputSchema };
+if (!agent.exists) {
+  agent.init(inputSchema, outputSchema);
+}
+
+export { inputSchema, outputSchema, agent };
 
 export async function processMessage(input: z.infer<typeof inputSchema>): Promise<z.infer<typeof outputSchema>> {
   return {
