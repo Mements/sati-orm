@@ -1,5 +1,35 @@
 #!/usr/bin/env bun
 
+/*
+todo: okay so now we have this sati-daemon running in background which executes function for agents, now we need to write a new package sati-telegram for integration with telegram so it can work like this we should be able to write client program like this:
+
+onTelegramMessage(async (msg, { addButtons, appendResponse }) => {
+    (in this case we insert first not call so agent function is not invoked because our sati-telegram package implements this practical workflow where we wait first for user to click a button under a message which appears here once we insert it always happen that way)
+    await agent.insert({
+        group: msg.chat_id,
+        text: msg.text,
+    }, null);
+
+    (so our package should implement something like addButton here)
+    addButtons({
+        'Process It': async (progress) => 
+            progress(10)
+            (maybe we dont even need to insert that above because we already have it in lexical scope of closure)
+            const result = await agent.call({
+                group, text
+            })
+            (and so such an agent lets say executes its workflow and it returns audio or something)
+            (so it sends an audio file as response by editing original message attaching audio file to it)
+            progress(99)
+            await sleep(1000)
+            replyResponse(result)
+            (its important that when function callback of the button when "Process it " was pressed then buttons are removed and message is updated with a suffix in bold text showing a progress thats why we also have this progress function we invoke it update that text multiple times and finally when response is send then original message is suffixed with success message and possibly has media files attached to it so this is our framework for managing personal ai workflows in telegram)
+        },
+        'Forget It': () => {},
+    })
+})
+*/
+
 import { measure } from './helpers';
 import { join } from 'node:path';
 import { Database } from 'bun:sqlite';
@@ -64,7 +94,7 @@ if (import.meta.main) {
     async function processTask(server: any, agentName: string, taskId: string) {
       await measure(async () => {
         try {
-          const dbPath = join(DB_DIR, 'agents', `${agentName}.sqlite`);
+          const dbPath = join(DB_DIR, `${agentName}.sqlite`);
           const db = new Database(dbPath);
           
           const inputRecord = db.query(`

@@ -14,22 +14,22 @@ import dedent from "dedent";
 import { OUTPUT_DATA_WRAPPER, RESERVED_SQLITE_WORDS } from "./constants";
 import { objToXml, validateSchemaMatch, validateSchemaOutput, zodToSqliteSchema } from "./helpers";
 import chalk from "chalk";
+import { mkdirSync } from "node:fs";
 
 const { randomUUID: uuid } = new ShortUniqueId({
   length: 12,
   dictionary: "alphanum_lower",
 });
 
+// Updated AgentRecord: we no longer store input_table or output_table because they are always "input" and "output".
 interface AgentRecord {
   name: string;
   from_schema: string;
   to_schema: string;
-  input_table: string;
-  output_table: string;
   database_path: string;
 }
 
-// Database connection pool to manage multiple database connections
+// Database connection pool to manage multiple database connections.
 const dbConnections: Map<string, Database> = new Map();
 
 export const verboseLog = (category: string, action: string, details?: any) => {
@@ -105,7 +105,7 @@ const dataDir = path.join(
   );
   verboseLog("Database", "Initializing main database", { path: dbPath });
 
-  await mkdir(path.dirname(dbPath), { recursive: true });
+  mkdirSync(path.dirname(dbPath), { recursive: true });
   mainDb = new Database(dbPath);
 
   if (os.platform() === "darwin") {
@@ -114,17 +114,17 @@ const dataDir = path.join(
     );
   }
 
-  // todo: because we separated each agent into its own database, we probably dont need to store input/output table here anymore because its always called "input" and "output"
+  // We no longer need to store input_table and output_table because every agent uses "input" and "output".
+  // Additionally, we store database_path. This is safe because the base directory (e.g. process.env.HOME)
+  // is assumed to be consistent across machines, allowing the databases to be moved with their relative paths intact.
   mainDb.query(`
     CREATE TABLE IF NOT EXISTS agents (
       name TEXT PRIMARY KEY,
       from_schema TEXT,
       to_schema TEXT,
-      input_table TEXT,
-      output_table TEXT,
       database_path TEXT
     )
-  `).run(); // todo: explain why storing database_path is safe and will work if we move databases across machines
+  `).run();
 
   try {
     mainDb.query("SELECT database_path FROM agents LIMIT 1").get();
@@ -155,13 +155,13 @@ function getAgentDb(agentName: string): Database {
     throw new Error(`Agent ${agentName} not found`);
   }
 
-  verboseLog("Database", `Opening connection to agent database`, { agent: agentName, path: agent.database_path });
+  verboseLog("Database", "Opening connection to agent database", { agent: agentName, path: agent.database_path });
 
   const agentDb = new Database(agent.database_path);
   sqliteVec.load(agentDb);
   
   // Create vector index table in agent database
-  agentDb.query<AgentRecord, any>(`
+  agentDb.query(`
     CREATE VIRTUAL TABLE IF NOT EXISTS vec_index USING vec0(
       id TEXT PRIMARY KEY,
       agent_name TEXT NOT NULL PARTITION KEY,
@@ -398,12 +398,14 @@ function Agent<I extends z.ZodObject<any>, O extends z.ZodObject<any>>(name: str
       throw new Error("Agent not initialized");
     }
 
+    // Since we no longer store input_table and output_table in mainDb,
+    // we use the hard-coded table names "input" and "output".
     instance = createAgentInstance(
       name,
       dezerialize(JSON.parse(agent.from_schema)) as I,
       dezerialize(JSON.parse(agent.to_schema)) as O,
-      agent.input_table,
-      agent.output_table,
+      "input",
+      "output",
       logVerbose,
     );
 
@@ -467,44 +469,43 @@ function Agent<I extends z.ZodObject<any>, O extends z.ZodObject<any>>(name: str
       
       // Create agent-specific database file
       const dbPath = path.join(dataDir, `${name}.sqlite`);
-      verboseLog("Database", `Creating agent database`, { agent: name, path: dbPath });
+      verboseLog("Database", "Creating agent database", { agent: name, path: dbPath });
       
-      // todo: explain why we dont use await here in a dev note
-      mkdir(path.dirname(dbPath), { recursive: true }).then(() => {
-        // Create and initialize the agent database
-        const agentDb = new Database(dbPath);
-        sqliteVec.load(agentDb);
-        
-        // Create tables in agent database
-        agentDb.query(zodToSqliteSchema(from, inputTable)).run();
-        agentDb.query(zodToSqliteSchema(to, outputTable)).run();
-        
-        // todo: maybe we can reuse getAgentDb here
-        agentDb.query(`
-          CREATE VIRTUAL TABLE IF NOT EXISTS vec_index USING vec0(
-            id TEXT PRIMARY KEY,
-            agent_name TEXT NOT NULL PARTITION KEY,
-            input_embedding FLOAT[1536],
-            output_embedding FLOAT[1536]
-          );
-        `).run();
-        
-        // Store database connection
-        dbConnections.set(name, agentDb);
-      });
+      mkdirSync(path.dirname(dbPath), { recursive: true });
+      
+      // Create and initialize the agent database
+      const agentDb = new Database(dbPath);
+      sqliteVec.load(agentDb);
+      
+      // Create tables in agent database using the provided zod schemas.
+      agentDb.query(zodToSqliteSchema(from, inputTable)).run();
+      agentDb.query(zodToSqliteSchema(to, outputTable)).run();
+      
+      // Although we could reuse getAgentDb here, we create the virtual table immediately
+      // to ensure that all initialization happens in the same connection.
+      agentDb.query(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS vec_index USING vec0(
+          id TEXT PRIMARY KEY,
+          agent_name TEXT NOT NULL PARTITION KEY,
+          input_embedding FLOAT[1536],
+          output_embedding FLOAT[1536]
+        );
+      `).run();
+      
+      // Store database connection
+      dbConnections.set(name, agentDb);
 
       logVerbose("Created tables", { inputTable, outputTable, dbPath });
 
-      // Store agent metadata in main database
+      // Store agent metadata in main database.
+      // We do not store input_table/output_table here because they are fixed.
       mainDb.query(`
-        INSERT INTO agents (name, from_schema, to_schema, input_table, output_table, database_path)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO agents (name, from_schema, to_schema, database_path)
+        VALUES (?, ?, ?, ?)
       `).run(
         name,
         JSON.stringify(zerialize(from)),
         JSON.stringify(zerialize(to)),
-        inputTable,
-        outputTable,
         dbPath,
       );
 
@@ -612,7 +613,6 @@ function Agent<I extends z.ZodObject<any>, O extends z.ZodObject<any>>(name: str
       return inst.delete(id);
     },
 
-    
     async call(input: z.infer<I>, options: { timeout?: number } = {}) {
       const timeout = options.timeout || 60000;
   
@@ -640,6 +640,7 @@ function Agent<I extends z.ZodObject<any>, O extends z.ZodObject<any>>(name: str
           const message = JSON.parse(event.data);
           
           if (message.type === 'subscribed') {
+            // do nothing
           }
           else if (message.type === 'update' && message.agent === name && 
               (message.data.id === id || message.data.input_id === id)) {
@@ -701,8 +702,8 @@ function Agent<I extends z.ZodObject<any>, O extends z.ZodObject<any>>(name: str
  * @param name - Unique name for the agent
  * @param fromSchema - Zod schema defining input structure
  * @param toSchema - Zod schema defining output structure
- * @param inputTable - Name of table storing input data
- * @param outputTable - Name of table storing output data
+ * @param inputTable - Name of table storing input data (always "input")
+ * @param outputTable - Name of table storing output data (always "output")
  * @param logVerbose - Function for verbose logging
  * @returns Agent instance with inference and training capabilities
  */
@@ -731,6 +732,8 @@ function createAgentInstance(
   // Get the agent-specific database
   const agentDb = getAgentDb(name);
 
+  // Helper function to insert a record.
+  // The table is expected to have been created already – if not, ensure that the agent database is fully initialized.
   const insertRecord = (table: string, data: Record<string, any>) => {
     return measure(
       async () => {
@@ -740,23 +743,6 @@ function createAgentInstance(
           if (typeof v === "object") return JSON.stringify(v);
           return v as SQLiteValue;
         });
-/*
-todo:
-
-fix
-
-[Database] Starting Insert into input
-739 |         const placeholders = columns.map(() => "?").join(", ");
-740 |         const values = Object.values(data).map(v => {
-741 |           if (typeof v === "object") return JSON.stringify(v);
-742 |           return v as SQLiteValue;
-743 |         });
-744 |         agentDb.query(
-                      ^
-SQLiteError: no such table: input
-      errno: 1,
- byteOffset: -1,
-*/
         agentDb.query(
           `INSERT INTO ${table} (${columns.join(", ")}) VALUES (${placeholders})`,
         ).run(...values);
@@ -900,7 +886,7 @@ SQLiteError: no such table: input
           LEFT JOIN ${inputTable} i ON i.id = si.id
           LEFT JOIN ${outputTable} o ON o.id = si.id
           WHERE 1=1
-        `;
+          `;
 
           const params: any[] = [name, JSON.stringify(targetEmbed)];
           logVerbose("Running similarity search", { query, name, embedSize: targetEmbed.length });
@@ -1059,10 +1045,10 @@ SQLiteError: no such table: input
           // Insert input record
           await insertRecord(inputTable, { id, ...flatInput });
           
-          // Only insert output if provided and not null
+          // Only insert output if provided and not empty
           if (output && Object.keys(output).length > 0) {
             try {
-              // Validate output (use partial validation if it's not complete)
+              // Validate output (using partial validation if it's incomplete)
               const validOutput = toSchema.partial().parse(output);
               
               // Prepare output for storage
