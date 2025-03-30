@@ -1,35 +1,5 @@
 #!/usr/bin/env bun
 
-/*
-todo: okay so now we have this sati-daemon running in background which executes function for agents, now we need to write a new package sati-telegram for integration with telegram so it can work like this we should be able to write client program like this:
-
-onTelegramMessage(async (msg, { addButtons, appendResponse }) => {
-    (in this case we insert first not call so agent function is not invoked because our sati-telegram package implements this practical workflow where we wait first for user to click a button under a message which appears here once we insert it always happen that way)
-    await agent.insert({
-        group: msg.chat_id,
-        text: msg.text,
-    }, null);
-
-    (so our package should implement something like addButton here)
-    addButtons({
-        'Process It': async (progress) => 
-            progress(10)
-            (maybe we dont even need to insert that above because we already have it in lexical scope of closure)
-            const result = await agent.call({
-                group, text
-            })
-            (and so such an agent lets say executes its workflow and it returns audio or something)
-            (so it sends an audio file as response by editing original message attaching audio file to it)
-            progress(99)
-            await sleep(1000)
-            replyResponse(result)
-            (its important that when function callback of the button when "Process it " was pressed then buttons are removed and message is updated with a suffix in bold text showing a progress thats why we also have this progress function we invoke it update that text multiple times and finally when response is send then original message is suffixed with success message and possibly has media files attached to it so this is our framework for managing personal ai workflows in telegram)
-        },
-        'Forget It': () => {},
-    })
-})
-*/
-
 import { measure } from './helpers';
 import { join } from 'node:path';
 import { Database } from 'bun:sqlite';
@@ -55,25 +25,47 @@ if (import.meta.main) {
             
             if (data.type === 'subscribe' && data.agent) {
               ws.subscribe(data.agent);
-              
               ws.send(JSON.stringify({ 
                 type: 'subscribed', 
                 agent: data.agent 
               }));
-              
               console.log(`Client subscribed to agent: ${data.agent}`);
             }
-            else if (data.type === 'new_task' && data.agent && data.id) {
-              const { agent: agentName, id } = data;
+            else if (data.type === 'insert_task' && data.agent && data.id) {
+              const { agent: agentName, id, input } = data;
+              console.log(`Inserting task ${id} for agent ${agentName}`);
               
-              console.log(`New task received: ${id} for agent ${agentName}`);
+              try {
+                const dbPath = join(DB_DIR, `${agentName}.sqlite`);
+                const db = new Database(dbPath);
+                storeInput(db, id, input);
+                db.close();
+                
+                ws.send(JSON.stringify({
+                  type: 'inserted',
+                  agent: agentName,
+                  id: id
+                }));
+              } catch (error) {
+                console.error(`Error inserting task ${id}:`, error);
+                ws.send(JSON.stringify({
+                  type: 'error',
+                  agent: agentName,
+                  id: id,
+                  message: error.message
+                }));
+              }
+            }
+            else if (data.type === 'call_task' && data.agent && data.id) {
+              const { agent: agentName, id } = data;
+              console.log(`Processing task ${id} for agent ${agentName}`);
               
               try {
                 await measure(async () => {
                   await processTask(server, agentName, id);
                 }, `Process task ${id} for ${agentName}`);
               } catch (error) {
-                console.error(`Error processing task ${id} for ${agentName}:`, error);
+                console.error(`Error processing task ${id}:`, error);
               }
             }
           }, "Process WebSocket message");
@@ -97,110 +89,94 @@ if (import.meta.main) {
           const dbPath = join(DB_DIR, `${agentName}.sqlite`);
           const db = new Database(dbPath);
           
-          const inputRecord = db.query(`
-            SELECT * FROM input WHERE id = ?
-          `).get(taskId);
-          
-          if (!inputRecord) {
-            console.error(`Input record ${taskId} not found for agent ${agentName}`);
-            return;
-          }
+          const inputRecord = db.query(`SELECT * FROM input WHERE id = ?`).get(taskId);
+          if (!inputRecord) throw new Error(`Input record ${taskId} not found`);
           
           const input = extractInput(inputRecord);
-          console.log(`Processing input for task ${taskId}: `, input);
-          
-          const agentModule = await measure(
-            async () => import(join(AGENTS_DIR, `${agentName}.js`)), 
-            `Import agent module ${agentName}`
-          );
+          const agentModule = await import(join(AGENTS_DIR, `${agentName}.js`));
           
           if (typeof agentModule.processMessage !== 'function') {
-            throw new Error(`Agent ${agentName} doesn't export a processMessage function`);
+            throw new Error(`Agent ${agentName} missing processMessage function`);
           }
-          
-          const output = await agentModule.processMessage(input);
-          
+
+          // Progress reporting callback
+          const sendProgress = (progress: number) => {
+            server.publish(agentName, JSON.stringify({
+              type: 'progress',
+              agent: agentName,
+              id: taskId,
+              progress
+            }));
+          };
+
+          // Execute agent processing
+          const output = agentModule.processMessage.length >= 2 
+            ? await agentModule.processMessage(input, sendProgress)
+            : await agentModule.processMessage(input);
+
+          // Store and notify completion
           storeOutput(db, taskId, output);
-          
           server.publish(agentName, JSON.stringify({
             type: 'update',
             agent: agentName,
             data: { id: taskId, input_id: taskId }
           }));
           
-          console.log(`Task ${taskId} completed for agent ${agentName}`);
+          db.close();
         } catch (error) {
-          console.error(`Failed to process task ${taskId} for agent ${agentName}:`, error);
+          console.error(`Task processing failed:`, error);
+          throw error;
         }
       }, `Process task ${taskId} for ${agentName}`);
-    }
-    
-    function extractInput(record: any): any {
-      const input: Record<string, any> = {};
-      
-      for (const [key, value] of Object.entries(record)) {
-        if (key === 'id') {
-          input.id = value;
-          continue;
-        }
-        
-        if (key.endsWith('_json')) {
-          const baseKey = key.slice(0, -5);
-          try {
-            input[baseKey] = JSON.parse(value as string);
-          } catch (e) {
-            input[baseKey] = value;
-          }
-        } else {
-          input[key] = value;
-        }
-      }
-      
-      return input;
-    }
-    
-    function storeOutput(db: Database, id: string, output: any): void {
-      const flatOutput: Record<string, any> = { id };
-      
-      for (const [key, value] of Object.entries(output)) {
-        if (typeof value === 'object' && value !== null) {
-          flatOutput[`${key}_json`] = JSON.stringify(value);
-        } else {
-          flatOutput[key] = value;
-        }
-      }
-      
-      const keys = Object.keys(flatOutput);
-      const placeholders = keys.map(() => '?').join(', ');
-      const values = Object.values(flatOutput);
-      
-      try {
-        const existing = db.query('SELECT id FROM output WHERE id = ?').get(id);
-        
-        if (existing) {
-          const setClause = keys.map(k => `${k} = ?`).join(', ');
-          db.query(`UPDATE output SET ${setClause} WHERE id = ?`).run(...values, id);
-        } else {
-          db.query(`INSERT INTO output (${keys.join(', ')}) VALUES (${placeholders})`).run(...values);
-        }
-      } catch (error) {
-        console.error(`Error storing output for ${id}:`, error);
-        throw error;
-      }
     }
   }, "Run sati-daemon").catch(error => {
     console.error("Failed to start daemon:", error);
     process.exit(1);
   });
 
-  // Shutdown handlers
-  process.on('SIGINT', () => {
-    console.log("sati-daemon stopped via SIGINT");
-    process.exit(0);
-  });
+  // Database utilities
+  function storeInput(db: Database, id: string, input: any) {
+    const flatInput: Record<string, any> = { id };
+    for (const [key, value] of Object.entries(input)) {
+      flatInput[key + (typeof value === 'object' ? '_json' : '')] = 
+        typeof value === 'object' ? JSON.stringify(value) : value;
+    }
 
-  process.on('SIGTERM', () => {
-    console.log("sati-daemon stopped via SIGTERM");
-    process.exit(0);
-  });
+    const keys = Object.keys(flatInput);
+    const values = Object.values(flatInput);
+    
+    db.query(
+      keys.some(k => k === 'id') 
+        ? `INSERT OR REPLACE INTO input (${keys}) VALUES (${keys.map(() => '?')})`
+        : `UPDATE input SET ${keys.map(k => `${k}=?`).join(',')} WHERE id=?`
+    ).run(...values);
+  }
+
+  function storeOutput(db: Database, id: string, output: any) {
+    const flatOutput: Record<string, any> = { id };
+    for (const [key, value] of Object.entries(output)) {
+      flatOutput[key + (typeof value === 'object' ? '_json' : '')] = 
+        typeof value === 'object' ? JSON.stringify(value) : value;
+    }
+
+    const keys = Object.keys(flatOutput);
+    const values = Object.values(flatOutput);
+    
+    db.query(
+      `INSERT OR REPLACE INTO output (${keys}) VALUES (${keys.map(() => '?')})`
+    ).run(...values);
+  }
+
+  function extractInput(record: Record<string, any>) {
+    return Object.entries(record).reduce((acc, [key, value]) => {
+      if (key === 'id') return { ...acc, id: value };
+      const isJson = key.endsWith('_json');
+      acc[isJson ? key.slice(0, -5) : key] = isJson ? JSON.parse(value) : value;
+      return acc;
+    }, {});
+  }
+
+  // Signal handlers
+  process.on('SIGINT', () => process.exit(0));
+  process.on('SIGTERM', () => process.exit(0));
 }
